@@ -1,17 +1,20 @@
 /**
  * @file gf_ops.h
- * @brief Galois Field arithmetic operations for CUTLASS
+ * @brief Galois Field arithmetic operations
  *
- * This file defines the numeric type traits and operations required
- * by CUTLASS for Galois Field arithmetic in GF(2^8).
+ * This file defines the GF(2^8) element type and basic operations
+ * for use in CUDA kernels.
  */
 
 #pragma once
 
 #include <stdint.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-#include <cutlass/array.h>
+
+#ifdef __CUDACC__
+#define GF_HOST_DEVICE __host__ __device__
+#else
+#define GF_HOST_DEVICE
+#endif
 
 namespace cutlass {
 
@@ -23,28 +26,28 @@ namespace cutlass {
 struct gf28_t {
     uint8_t storage;
 
-    CUTLASS_HOST_DEVICE
+    GF_HOST_DEVICE
     gf28_t() : storage(0) {}
 
-    CUTLASS_HOST_DEVICE
+    GF_HOST_DEVICE
     gf28_t(uint8_t value) : storage(value) {}
 
-    CUTLASS_HOST_DEVICE
+    GF_HOST_DEVICE
     gf28_t(int value) : storage(static_cast<uint8_t>(value)) {}
 
-    CUTLASS_HOST_DEVICE
+    GF_HOST_DEVICE
     operator uint8_t() const { return storage; }
 
-    CUTLASS_HOST_DEVICE
+    GF_HOST_DEVICE
     operator int() const { return static_cast<int>(storage); }
 
-    CUTLASS_HOST_DEVICE
+    GF_HOST_DEVICE
     gf28_t& operator=(uint8_t value) {
         storage = value;
         return *this;
     }
 
-    CUTLASS_HOST_DEVICE
+    GF_HOST_DEVICE
     gf28_t& operator=(int value) {
         storage = static_cast<uint8_t>(value);
         return *this;
@@ -79,89 +82,6 @@ struct GF28Arithmetic {
     static constexpr int kExpTableSize = 768;  // 255 * 3 for overflow handling
 };
 
-// ============================================================================
-//                     NumericCast Specialization
-// ============================================================================
-
-template <>
-struct NumericCast<gf28_t, gf28_t> {
-    CUTLASS_HOST_DEVICE
-    static gf28_t transform(gf28_t source) {
-        return source;
-    }
-};
-
-template <>
-struct NumericCast<gf28_t, uint8_t> {
-    CUTLASS_HOST_DEVICE
-    static gf28_t transform(uint8_t source) {
-        return gf28_t(source);
-    }
-};
-
-template <>
-struct NumericCast<uint8_t, gf28_t> {
-    CUTLASS_HOST_DEVICE
-    static uint8_t transform(gf28_t source) {
-        return source.storage;
-    }
-};
-
-template <>
-struct NumericCast<gf28_t, int> {
-    CUTLASS_HOST_DEVICE
-    static gf28_t transform(int source) {
-        return gf28_t(static_cast<uint8_t>(source));
-    }
-};
-
-template <>
-struct NumericCast<int, gf28_t> {
-    CUTLASS_HOST_DEVICE
-    static int transform(gf28_t source) {
-        return static_cast<int>(source.storage);
-    }
-};
-
-// ============================================================================
-//                     NumericArrayConverter Specializations
-// ============================================================================
-
-/// Converter for arrays of GF(2^8) elements
-template <int N>
-struct NumericArrayConverter<gf28_t, gf28_t, N> {
-    CUTLASS_HOST_DEVICE
-    Array<gf28_t, N> operator()(Array<gf28_t, N> const& source) {
-        return source;
-    }
-};
-
-template <int N>
-struct NumericArrayConverter<gf28_t, uint8_t, N> {
-    CUTLASS_HOST_DEVICE
-    Array<gf28_t, N> operator()(Array<uint8_t, N> const& source) {
-        Array<gf28_t, N> result;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < N; ++i) {
-            result[i] = gf28_t(source[i]);
-        }
-        return result;
-    }
-};
-
-template <int N>
-struct NumericArrayConverter<uint8_t, gf28_t, N> {
-    CUTLASS_HOST_DEVICE
-    Array<uint8_t, N> operator()(Array<gf28_t, N> const& source) {
-        Array<uint8_t, N> result;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < N; ++i) {
-            result[i] = source[i].storage;
-        }
-        return result;
-    }
-};
-
 } // namespace cutlass
 
 // ============================================================================
@@ -185,16 +105,40 @@ extern "C" void init_gf_tables(uint8_t* gf_exp, uint8_t* gf_log);
  * @param gf_log Logarithm table
  * @return Product in GF(2^8)
  */
-CUTLASS_HOST_DEVICE inline uint8_t gf_mul(uint8_t a, uint8_t b,
-                                           const uint8_t* gf_exp,
-                                           const uint8_t* gf_log) {
+GF_HOST_DEVICE inline uint8_t gf_mul(uint8_t a, uint8_t b,
+                                      const uint8_t* gf_exp,
+                                      const uint8_t* gf_log) {
     if (a == 0 || b == 0) return 0;
     return gf_exp[gf_log[a] + gf_log[b]];
 }
 
 /**
+ * @brief GF(2^8) multiplication using constant memory tables
+ */
+GF_HOST_DEVICE inline uint8_t gf_mul_const(uint8_t a, uint8_t b);
+
+/**
  * @brief GF(2^8) addition (XOR)
  */
-CUTLASS_HOST_DEVICE inline uint8_t gf_add(uint8_t a, uint8_t b) {
+GF_HOST_DEVICE inline uint8_t gf_add(uint8_t a, uint8_t b) {
     return a ^ b;
 }
+
+/**
+ * @brief GF(2^8) bit-level multiplication (no tables required)
+ */
+GF_HOST_DEVICE inline uint8_t gf_mul_bitwise(uint8_t a, uint8_t b) {
+    uint8_t result = 0;
+    uint8_t prim_poly = 0x1D;  // x^8 + x^4 + x^3 + x^2 + 1
+
+    while (b) {
+        if (b & 1) {
+            result ^= a;
+        }
+        a = (a << 1) ^ ((a & 0x80) ? prim_poly : 0);
+        b >>= 1;
+    }
+    return result;
+}
+
+#undef GF_HOST_DEVICE
