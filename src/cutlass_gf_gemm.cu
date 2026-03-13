@@ -102,6 +102,101 @@ __global__ void gf_gemm_kernel_simple(const uint8_t* __restrict__ A,
     }
 }
 
+/**
+ * @brief Tiled matrix multiplication kernel for GF(2^8) with alpha/beta scaling
+ *
+ * Computes: C = alpha * (A * B) + beta * C
+ *
+ * @param A Input matrix A
+ * @param B Input matrix B
+ * @param C Input/output matrix C
+ * @param alpha Scalar multiplier for A*B (GF element)
+ * @param beta Scalar multiplier for original C (GF element)
+ * @param m Number of rows of A and C
+ * @param n Number of columns of B and C
+ * @param k Number of columns of A and rows of B
+ * @param lda Leading dimension of A
+ * @param ldb Leading dimension of B
+ * @param ldc Leading dimension of C
+ */
+__global__ void gf_gemm_kernel_scaled(const uint8_t* __restrict__ A,
+                                       const uint8_t* __restrict__ B,
+                                       uint8_t* C,
+                                       uint8_t alpha,
+                                       uint8_t beta,
+                                       int m, int n, int k,
+                                       int lda, int ldb, int ldc) {
+    constexpr int TILE_SIZE = 16;
+
+    __shared__ uint8_t As[TILE_SIZE][TILE_SIZE];
+    __shared__ uint8_t Bs[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    uint8_t accum = 0;
+    int num_tiles = (k + TILE_SIZE - 1) / TILE_SIZE;
+
+    // Load and scale original C if beta != 0
+    uint8_t c_scaled = 0;
+    if (beta != 0 && row < m && col < n) {
+        uint8_t c_val = C[row * ldc + col];
+        if (beta == 1) {
+            c_scaled = c_val;
+        } else if (c_val != 0) {
+            int log_sum = d_gflog_const[c_val] + d_gflog_const[beta];
+            c_scaled = d_gfexp_const[log_sum];
+        }
+    }
+
+    for (int t = 0; t < num_tiles; ++t) {
+        int tiled_col_a = t * TILE_SIZE + threadIdx.x;
+        int tiled_row_b = t * TILE_SIZE + threadIdx.y;
+
+        // Load tile of A
+        if (row < m && tiled_col_a < k) {
+            As[threadIdx.y][threadIdx.x] = A[row * lda + tiled_col_a];
+        } else {
+            As[threadIdx.y][threadIdx.x] = 0;
+        }
+
+        // Load tile of B
+        if (tiled_row_b < k && col < n) {
+            Bs[threadIdx.y][threadIdx.x] = B[tiled_row_b * ldb + col];
+        } else {
+            Bs[threadIdx.y][threadIdx.x] = 0;
+        }
+
+        __syncthreads();
+
+        // Compute partial dot product
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            uint8_t a = As[threadIdx.y][i];
+            uint8_t b = Bs[i][threadIdx.x];
+
+            if (a != 0 && b != 0) {
+                int log_sum = d_gflog_const[a] + d_gflog_const[b];
+                accum ^= d_gfexp_const[log_sum];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (row < m && col < n) {
+        // Apply alpha scaling to result
+        if (alpha == 0) {
+            accum = 0;
+        } else if (alpha != 1) {
+            int log_sum = d_gflog_const[accum] + d_gflog_const[alpha];
+            accum = d_gfexp_const[log_sum];
+        }
+        // Add beta * C (XOR in GF(2^8))
+        accum ^= c_scaled;
+        C[row * ldc + col] = accum;
+    }
+}
+
 /// Internal implementation structure
 struct GFGemmImpl {
     GFGemmConfig config;
@@ -250,10 +345,37 @@ GFGemmError gf_gemm_compute(GFGemmHandle handle,
                             const uint8_t* beta,
                             uint8_t* C, int ldc,
                             cudaStream_t stream) {
-    if (beta == nullptr || beta[0] == 0) {
+    if (handle == nullptr || !handle->initialized) {
+        return GF_GEMM_ERROR_NOT_INITIALIZED;
+    }
+
+    if (m <= 0 || n <= 0 || k <= 0 || A == nullptr || B == nullptr || C == nullptr) {
+        return GF_GEMM_ERROR_INVALID_VALUE;
+    }
+
+    // Handle default values for alpha and beta
+    uint8_t alpha_val = (alpha != nullptr) ? alpha[0] : 1;
+    uint8_t beta_val = (beta != nullptr) ? beta[0] : 0;
+
+    // Fast path: if alpha=1 and beta=0, use simple kernel
+    if (alpha_val == 1 && beta_val == 0) {
         return gf_gemm_mm(handle, m, n, k, A, lda, B, ldb, C, ldc, stream);
     }
-    return GF_GEMM_ERROR_UNSUPPORTED;
+
+    constexpr int TILE_SIZE = 16;
+    dim3 block(TILE_SIZE, TILE_SIZE);
+    dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE,
+              (m + TILE_SIZE - 1) / TILE_SIZE);
+
+    gf_gemm_kernel_scaled<<<grid, block, 0, stream>>>(A, B, C, alpha_val, beta_val,
+                                                       m, n, k, lda, ldb, ldc);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return GF_GEMM_ERROR_CUDA_KERNEL_FAILED;
+    }
+
+    return GF_GEMM_SUCCESS;
 }
 
 GFGemmError gf_gemm_synchronize(GFGemmHandle handle) {

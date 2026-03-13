@@ -36,16 +36,14 @@ constexpr int GFLOG_TABLE_SIZE = 256;
  * Table is extended: gfexp[i + 255] = gfexp[i] for i in [0, 511]
  * This allows multiplication without modulo operation on indices
  */
-GF_HOST_DEVICE constexpr uint8_t get_gfexp(int index) {
-    // Generate exp table at compile time using primitive polynomial
-    // This is a simplified version - actual table will be generated at runtime
-    // or stored in constant memory
+GF_HOST_DEVICE inline uint8_t get_gfexp(int index) {
+    // Generate exp table at runtime using primitive polynomial
     uint8_t exp = 1;
     uint8_t prim_poly = PRIM_POLY;
 
-    // Handle extended indices
+    // Handle extended indices by wrapping around FIELD_MAX (255)
+    while (index < 0) index += FIELD_MAX;
     index = index % FIELD_MAX;
-    if (index < 0) index += FIELD_MAX;
 
     for (int i = 0; i < index; ++i) {
         exp = (exp << 1) ^ ((exp & 0x80) ? prim_poly : 0);
@@ -58,7 +56,7 @@ GF_HOST_DEVICE constexpr uint8_t get_gfexp(int index) {
  *
  * gflog[alpha^i] = i, gflog[0] = 0 (undefined, but set to 0 for safety)
  */
-GF_HOST_DEVICE constexpr uint8_t get_gflog(uint8_t value) {
+GF_HOST_DEVICE inline uint8_t get_gflog(uint8_t value) {
     if (value == 0) return 0;
 
     uint8_t exp = 1;
@@ -68,7 +66,7 @@ GF_HOST_DEVICE constexpr uint8_t get_gflog(uint8_t value) {
         if (exp == value) return (uint8_t)log;
         exp = (exp << 1) ^ ((exp & 0x80) ? prim_poly : 0);
     }
-    return 0; // Should never reach here
+    return 0;
 }
 
 /**
