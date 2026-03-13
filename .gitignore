@@ -1,0 +1,44 @@
+# Build directory
+build/
+*.build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.so
+*.a
+*.lib
+*.dll
+*.dylib
+*.cuo
+*.cudafe1.*
+*.module_id
+*.reg.c
+*.ii
+*.ptx
+*.fatbin
+*.cpp1-*.cpp
+
+# CUDA binaries
+*.exe
+*.out
+*.app
+
+# Dependencies
+*.d
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CUTLASS submodule
+3rdparty/
