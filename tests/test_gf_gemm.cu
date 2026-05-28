@@ -1032,6 +1032,144 @@ int test_error_handling() {
     return errors;
 }
 
+/**
+ * @brief Test explicit backend selection
+ */
+int test_backend_selection() {
+    printf("\n=== Test: Explicit Backend Selection ===\n");
+
+    int errors = 0;
+
+    // Test custom backend
+    {
+        GFGemmConfig config;
+        gf_gemm_config_init_default(&config);
+        config.backend = GF_GEMM_BACKEND_CUSTOM;
+
+        GFGemmHandle handle;
+        GFGemmError err = gf_gemm_create(&handle, &config);
+        if (err != GF_GEMM_SUCCESS) {
+            printf("  Custom backend creation: FAILED (%s)\n", gf_gemm_get_error_string(err));
+            errors++;
+        } else {
+            printf("  Custom backend creation: OK\n");
+            gf_gemm_destroy(handle);
+        }
+    }
+
+    // Test CUTLASS backend
+    {
+        GFGemmConfig config;
+        gf_gemm_config_init_default(&config);
+        config.backend = GF_GEMM_BACKEND_CUTLASS;
+
+        GFGemmHandle handle;
+        GFGemmError err = gf_gemm_create(&handle, &config);
+        if (err != GF_GEMM_SUCCESS) {
+            printf("  CUTLASS backend creation: FAILED (%s)\n", gf_gemm_get_error_string(err));
+            errors++;
+        } else {
+            printf("  CUTLASS backend creation: OK\n");
+            gf_gemm_destroy(handle);
+        }
+    }
+
+    // Test AUTO backend
+    {
+        GFGemmConfig config;
+        gf_gemm_config_init_default(&config);
+        config.backend = GF_GEMM_BACKEND_AUTO;
+
+        GFGemmHandle handle;
+        GFGemmError err = gf_gemm_create(&handle, &config);
+        if (err != GF_GEMM_SUCCESS) {
+            printf("  AUTO backend creation: FAILED (%s)\n", gf_gemm_get_error_string(err));
+            errors++;
+        } else {
+            printf("  AUTO backend creation: OK\n");
+            gf_gemm_destroy(handle);
+        }
+    }
+
+    printf("  Backend selection: %d failures\n", errors);
+    return errors;
+}
+
+/**
+ * @brief Test that both backends produce identical results
+ */
+int test_backend_comparison() {
+    printf("\n=== Test: Backend Comparison ===\n");
+
+    int m = 64, n = 64, k = 64;
+    size_t size_a = m * k, size_b = k * n, size_c = m * n;
+
+    uint8_t* h_A = (uint8_t*)malloc(size_a);
+    uint8_t* h_B = (uint8_t*)malloc(size_b);
+    uint8_t* h_C_custom = (uint8_t*)malloc(size_c);
+    uint8_t* h_C_cutlass = (uint8_t*)malloc(size_c);
+
+    srand(9999);
+    for (size_t i = 0; i < size_a; ++i) h_A[i] = rand() % 256;
+    for (size_t i = 0; i < size_b; ++i) h_B[i] = rand() % 256;
+
+    uint8_t *d_A, *d_B, *d_C;
+    CUDA_CHECK(cudaMalloc(&d_A, size_a));
+    CUDA_CHECK(cudaMalloc(&d_B, size_b));
+    CUDA_CHECK(cudaMalloc(&d_C, size_c));
+
+    CUDA_CHECK(cudaMemcpy(d_A, h_A, size_a, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B, size_b, cudaMemcpyHostToDevice));
+
+    int errors = 0;
+
+    // Run custom backend
+    {
+        GFGemmConfig config;
+        gf_gemm_config_init_default(&config);
+        config.backend = GF_GEMM_BACKEND_CUSTOM;
+
+        GFGemmHandle handle;
+        GF_GEMM_CHECK(gf_gemm_create(&handle, &config));
+        GF_GEMM_CHECK(gf_gemm_mm(handle, m, n, k, d_A, k, d_B, n, d_C, n, 0));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_C_custom, d_C, size_c, cudaMemcpyDeviceToHost));
+        gf_gemm_destroy(handle);
+    }
+
+    // Run CUTLASS backend
+    {
+        GFGemmConfig config;
+        gf_gemm_config_init_default(&config);
+        config.backend = GF_GEMM_BACKEND_CUTLASS;
+
+        GFGemmHandle handle;
+        GF_GEMM_CHECK(gf_gemm_create(&handle, &config));
+        GF_GEMM_CHECK(gf_gemm_mm(handle, m, n, k, d_A, k, d_B, n, d_C, n, 0));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_C_cutlass, d_C, size_c, cudaMemcpyDeviceToHost));
+        gf_gemm_destroy(handle);
+    }
+
+    // Compare results
+    for (size_t i = 0; i < size_c; ++i) {
+        if (h_C_custom[i] != h_C_cutlass[i]) {
+            errors++;
+            if (errors <= 5) {
+                printf("  Mismatch at [%zu]: custom=%d, cutlass=%d\n",
+                       i, h_C_custom[i], h_C_cutlass[i]);
+            }
+        }
+    }
+
+    printf("  64x64x64: %d mismatches between custom and CUTLASS backend\n", errors);
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    free(h_A); free(h_B); free(h_C_custom); free(h_C_cutlass);
+
+    return errors;
+}
+
 int main(int argc, char** argv) {
     printf("=== CUTLASS GF(2^8) GEMM Test Suite ===\n");
 
@@ -1061,6 +1199,8 @@ int main(int argc, char** argv) {
     failed += test_gf_boundary_values();
     failed += test_leading_dimension();
     failed += test_error_handling();
+    failed += test_backend_selection();
+    failed += test_backend_comparison();
 
     printf("\n=== Test Summary ===\n");
     if (failed == 0) {
