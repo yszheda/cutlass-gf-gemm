@@ -12,7 +12,6 @@
 
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/gemm.h>
-#include <cutlass/gemm/gemm_coord.h>
 #include <cutlass/layout/matrix.h>
 
 #include <cuda_runtime.h>
