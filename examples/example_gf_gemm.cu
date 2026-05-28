@@ -185,7 +185,7 @@ int run_profiler() {
 int main(int argc, char** argv) {
     printf("=== CUTLASS GF(2^8) Matrix Multiplication Example ===\n\n");
 
-    // Check for --profile flag
+    // Check for --profile flag first (before parsing dimensions)
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--profile") == 0) {
             return run_profiler();
