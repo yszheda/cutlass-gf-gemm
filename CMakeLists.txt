@@ -74,6 +74,10 @@ target_link_libraries(example_gf_gemm PRIVATE cutlass_gf_gemm CUDA::cudart)
 add_executable(test_gf_gemm tests/test_gf_gemm.cu)
 target_link_libraries(test_gf_gemm PRIVATE cutlass_gf_gemm CUDA::cudart)
 
+# CUTLASS traits test
+add_executable(test_cutlass_traits tests/test_cutlass_traits.cu)
+target_link_libraries(test_cutlass_traits PRIVATE cutlass_gf_gemm CUDA::cudart)
+
 # Install rules
 install(TARGETS cutlass_gf_gemm
     ARCHIVE DESTINATION lib
