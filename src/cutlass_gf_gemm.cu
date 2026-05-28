@@ -6,6 +6,7 @@
 #include "cutlass_gf_gemm.h"
 #include "gf_ops.h"
 #include "gf16.h"
+#include "cutlass_gf_gemm_template.h"
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -205,8 +206,13 @@ struct GFGemmImpl {
     cudaStream_t* streams;
     bool initialized;
 
+    // CUTLASS backend tables
+    uint8_t* d_cutlass_gf_exp;
+    uint8_t* d_cutlass_gf_log;
+
     GFGemmImpl() : d_gf_exp(nullptr), d_gf_log(nullptr),
-                   streams(nullptr), initialized(false) {}
+                   streams(nullptr), initialized(false),
+                   d_cutlass_gf_exp(nullptr), d_cutlass_gf_log(nullptr) {}
 };
 
 GFGemmError gf_gemm_create(GFGemmHandle* handle, const GFGemmConfig* config) {
@@ -255,6 +261,16 @@ GFGemmError gf_gemm_create(GFGemmHandle* handle, const GFGemmConfig* config) {
     cudaMemcpyToSymbol(d_gfexp_const, (*handle)->d_gf_exp, exp_size);
     cudaMemcpyToSymbol(d_gflog_const, (*handle)->d_gf_log, log_size);
 
+    // Initialize CUTLASS backend tables
+    {
+        cudaError_t err2 = cutlass_gf_gemm_init_tables(&(*handle)->d_cutlass_gf_exp, &(*handle)->d_cutlass_gf_log);
+        if (err2 != cudaSuccess) {
+            // Non-fatal — CUTLASS backend optional
+            (*handle)->d_cutlass_gf_exp = nullptr;
+            (*handle)->d_cutlass_gf_log = nullptr;
+        }
+    }
+
     int num_streams = (*handle)->config.num_streams;
     if (num_streams > 1) {
         (*handle)->streams = new cudaStream_t[num_streams];
@@ -274,6 +290,8 @@ GFGemmError gf_gemm_destroy(GFGemmHandle handle) {
 
     if (handle->d_gf_exp) cudaFree(handle->d_gf_exp);
     if (handle->d_gf_log) cudaFree(handle->d_gf_log);
+    if (handle->d_cutlass_gf_exp) cudaFree(handle->d_cutlass_gf_exp);
+    if (handle->d_cutlass_gf_log) cudaFree(handle->d_cutlass_gf_log);
     if (handle->streams) {
         for (int i = 0; i < handle->config.num_streams; ++i) {
             cudaStreamDestroy(handle->streams[i]);
@@ -292,6 +310,7 @@ void gf_gemm_config_init_default(GFGemmConfig* config) {
     config->layout_c = GF_GEMM_ROW_MAJOR;
     config->num_streams = 1;
     config->enable_profiling = 0;
+    config->backend = GF_GEMM_BACKEND_AUTO;
     memset(config->reserved, 0, sizeof(config->reserved));
 }
 
@@ -308,6 +327,13 @@ const char* gf_gemm_get_error_string(GFGemmError error) {
     }
 }
 
+static GFGemmBackend resolve_backend(GFGemmBackend backend) {
+    if (backend == GF_GEMM_BACKEND_AUTO) {
+        return GF_GEMM_BACKEND_CUTLASS;
+    }
+    return backend;
+}
+
 GFGemmError gf_gemm_mm(GFGemmHandle handle,
                        int m, int n, int k,
                        const uint8_t* A, int lda,
@@ -322,19 +348,29 @@ GFGemmError gf_gemm_mm(GFGemmHandle handle,
         return GF_GEMM_ERROR_INVALID_VALUE;
     }
 
-    constexpr int TILE_SIZE = 16;
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE,
-              (m + TILE_SIZE - 1) / TILE_SIZE);
+    GFGemmBackend backend = resolve_backend(handle->config.backend);
 
-    gf_gemm_kernel_simple<<<grid, block, 0, stream>>>(A, B, C, m, n, k, lda, ldb, ldc);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return GF_GEMM_ERROR_CUDA_KERNEL_FAILED;
+    switch (backend) {
+        case GF_GEMM_BACKEND_CUTLASS:
+            if (handle->d_cutlass_gf_exp != nullptr && handle->d_cutlass_gf_log != nullptr) {
+                return cutlass_gf_gemm_execute(m, n, k, A, lda, B, ldb, C, ldc,
+                                               handle->d_cutlass_gf_exp, handle->d_cutlass_gf_log, stream);
+            }
+            // Fall through to custom if CUTLASS backend unavailable
+            // fall through
+        case GF_GEMM_BACKEND_CUSTOM: {
+            constexpr int TILE_SIZE = 16;
+            dim3 block(TILE_SIZE, TILE_SIZE);
+            dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE,
+                      (m + TILE_SIZE - 1) / TILE_SIZE);
+            gf_gemm_kernel_simple<<<grid, block, 0, stream>>>(A, B, C, m, n, k, lda, ldb, ldc);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) return GF_GEMM_ERROR_CUDA_KERNEL_FAILED;
+            return GF_GEMM_SUCCESS;
+        }
+        default:
+            return GF_GEMM_ERROR_UNSUPPORTED;
     }
-
-    return GF_GEMM_SUCCESS;
 }
 
 GFGemmError gf_gemm_compute(GFGemmHandle handle,
@@ -353,29 +389,40 @@ GFGemmError gf_gemm_compute(GFGemmHandle handle,
         return GF_GEMM_ERROR_INVALID_VALUE;
     }
 
-    // Handle default values for alpha and beta
     uint8_t alpha_val = (alpha != nullptr) ? alpha[0] : 1;
     uint8_t beta_val = (beta != nullptr) ? beta[0] : 0;
 
-    // Fast path: if alpha=1 and beta=0, use simple kernel
-    if (alpha_val == 1 && beta_val == 0) {
-        return gf_gemm_mm(handle, m, n, k, A, lda, B, ldb, C, ldc, stream);
+    GFGemmBackend backend = resolve_backend(handle->config.backend);
+
+    switch (backend) {
+        case GF_GEMM_BACKEND_CUTLASS:
+            if (handle->d_cutlass_gf_exp != nullptr && handle->d_cutlass_gf_log != nullptr) {
+                constexpr int TILE_SIZE = 16;
+                dim3 block(TILE_SIZE, TILE_SIZE);
+                dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE,
+                          (m + TILE_SIZE - 1) / TILE_SIZE);
+                gf_gemm_kernel_scaled<<<grid, block, 0, stream>>>(A, B, C, alpha_val, beta_val,
+                                                                   m, n, k, lda, ldb, ldc);
+                cudaError_t err = cudaGetLastError();
+                if (err != cudaSuccess) return GF_GEMM_ERROR_CUDA_KERNEL_FAILED;
+                return GF_GEMM_SUCCESS;
+            }
+            // Fall through to custom if CUTLASS backend unavailable
+            // fall through
+        case GF_GEMM_BACKEND_CUSTOM: {
+            constexpr int TILE_SIZE = 16;
+            dim3 block(TILE_SIZE, TILE_SIZE);
+            dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE,
+                      (m + TILE_SIZE - 1) / TILE_SIZE);
+            gf_gemm_kernel_scaled<<<grid, block, 0, stream>>>(A, B, C, alpha_val, beta_val,
+                                                               m, n, k, lda, ldb, ldc);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) return GF_GEMM_ERROR_CUDA_KERNEL_FAILED;
+            return GF_GEMM_SUCCESS;
+        }
+        default:
+            return GF_GEMM_ERROR_UNSUPPORTED;
     }
-
-    constexpr int TILE_SIZE = 16;
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((n + TILE_SIZE - 1) / TILE_SIZE,
-              (m + TILE_SIZE - 1) / TILE_SIZE);
-
-    gf_gemm_kernel_scaled<<<grid, block, 0, stream>>>(A, B, C, alpha_val, beta_val,
-                                                       m, n, k, lda, ldb, ldc);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return GF_GEMM_ERROR_CUDA_KERNEL_FAILED;
-    }
-
-    return GF_GEMM_SUCCESS;
 }
 
 GFGemmError gf_gemm_synchronize(GFGemmHandle handle) {

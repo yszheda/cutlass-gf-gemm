@@ -51,6 +51,17 @@ typedef enum {
     GF_GEMM_COL_MAJOR = 1
 } GFGemmLayout;
 
+// ============================================================================
+//                     Backend Selection
+// ============================================================================
+
+/// GEMM backend implementation
+typedef enum {
+    GF_GEMM_BACKEND_CUSTOM = 0,    /// Original custom tiled kernel
+    GF_GEMM_BACKEND_CUTLASS = 1,   /// CUTLASS-structured kernel
+    GF_GEMM_BACKEND_AUTO = 2       /// Auto-select best backend (default)
+} GFGemmBackend;
+
 /// Configuration parameters for GFGemm
 typedef struct {
     /// Matrix A layout
@@ -68,8 +79,11 @@ typedef struct {
     /// Enable profiling
     int enable_profiling;
 
+    /// Backend selection
+    GFGemmBackend backend;
+
     /// Reserved for future use
-    int reserved[8];
+    int reserved[7];
 } GFGemmConfig;
 
 /// Initialize config with default values
