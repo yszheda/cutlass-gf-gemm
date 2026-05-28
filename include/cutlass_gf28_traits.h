@@ -10,9 +10,7 @@
 #pragma once
 
 #include "gf_ops.h"
-#include <cutlass/numeric_types.h>
-#include <cutlass/array.h>
-#include <cutlass/gemm/gemm.h>
+#include <cutlass/cutlass.h>
 #include <stdint.h>
 
 namespace cutlass {
@@ -21,52 +19,36 @@ namespace cutlass {
 //                     GF(2^8) Numeric Traits
 // ============================================================================
 
-/// Numeric traits for GF(2^8) element type
+/// Primary template for NumericTraits (CUTLASS may not provide one)
+template <typename T>
+struct NumericTraits {
+    using Element = T;
+    static constexpr int kCount = 1;
+    static constexpr bool kIsInteger = true;
+    static constexpr bool kIsFloat = false;
+    static constexpr bool kIsSigned = false;
+};
+
+/// Numeric traits specialization for GF(2^8) element type
 template <>
 struct NumericTraits<gf28_t> {
     using Element = gf28_t;
-
-    /// Storage type is uint8_t
     using StorageType = uint8_t;
-
-    /// Breakdown into component types (GF(2^8) is a single element)
     using BreakdownType = Element;
 
-    /// Number of breakdown elements
     static constexpr int kCount = 1;
-
-    /// Alignment in bytes
     static constexpr int kAlignment = 1;
-
-    /// Element size in bytes
     static constexpr int kElementSize = sizeof(Element);
 
-    /// Is integer type (GF elements are stored as integers)
     static constexpr bool kIsInteger = true;
-
-    /// Is real number (not complex)
     static constexpr bool kIsReal = false;
-
-    /// Is floating point
     static constexpr bool kIsFloat = false;
-
-    /// Is signed
     static constexpr bool kIsSigned = false;
 
-    /// Compute class — treated as integer for CUTLASS
-    static constexpr cutlass::FloatRoundStyle kRoundStyle = cutlass::FloatRoundStyle::round_to_zero;
-
-    /// Minimum value
-    static GF_HOST_DEVICE Element min() { return Element(0); }
-
-    /// Maximum value
-    static GF_HOST_DEVICE Element max() { return Element(255); }
-
-    /// Zero
-    static GF_HOST_DEVICE Element zero() { return Element(0); }
-
-    /// One (multiplicative identity)
-    static GF_HOST_DEVICE Element one() { return Element(1); }
+    static CUTLASS_HOST_DEVICE Element min() { return Element(0); }
+    static CUTLASS_HOST_DEVICE Element max() { return Element(255); }
+    static CUTLASS_HOST_DEVICE Element zero() { return Element(0); }
+    static CUTLASS_HOST_DEVICE Element one() { return Element(1); }
 };
 
 // ============================================================================
@@ -90,7 +72,7 @@ struct Gf28MmaOperator {
         static constexpr int kK = 1;
     };
 
-    GF_HOST_DEVICE
+    CUTLASS_HOST_DEVICE
     ElementD operator()(
         ElementA const& a,
         ElementB const& b,
