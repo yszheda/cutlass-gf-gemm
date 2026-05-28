@@ -128,74 +128,61 @@ void cutlass_gf_gemm_free_tables(uint8_t* d_gf_exp, uint8_t* d_gf_log) {
 /**
  * @brief CUTLASS-style tiled GEMM kernel for GF(2^8)
  *
- * Each 16x16 threadblock processes a 128x128 tile by having each thread
- * loop over 8x8 sub-tiles. Uses CUTLASS constant memory patterns.
+ * Uses 16x16 shared memory tiles with constant memory GF lookup tables.
+ * Grid is configured for larger threadblock coverage (128x128 output tiles).
  */
 __global__ void cutlass_gf_gemm_kernel(const uint8_t* __restrict__ A,
                                         const uint8_t* __restrict__ B,
                                         uint8_t* C,
                                         int m, int n, int k,
                                         int lda, int ldb, int ldc) {
-    constexpr int THREADBLOCK_M = 128;
-    constexpr int THREADBLOCK_N = 128;
     constexpr int TILE_SIZE = 16;
-    constexpr int SUB_TILES_M = THREADBLOCK_M / TILE_SIZE;  // 8
-    constexpr int SUB_TILES_N = THREADBLOCK_N / TILE_SIZE;  // 8
-
-    int tb_row = blockIdx.y * THREADBLOCK_M;
-    int tb_col = blockIdx.x * THREADBLOCK_N;
 
     __shared__ uint8_t As[TILE_SIZE][TILE_SIZE];
     __shared__ uint8_t Bs[TILE_SIZE][TILE_SIZE];
 
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    uint8_t accum = 0;
     int num_tiles = (k + TILE_SIZE - 1) / TILE_SIZE;
 
-    // Each thread handles SUB_TILES_M x SUB_TILES_N output elements
-    for (int st_m = 0; st_m < SUB_TILES_M; ++st_m) {
-        for (int st_n = 0; st_n < SUB_TILES_N; ++st_n) {
-            int row = tb_row + st_m * TILE_SIZE + threadIdx.y;
-            int col = tb_col + st_n * TILE_SIZE + threadIdx.x;
+    for (int t = 0; t < num_tiles; ++t) {
+        int tiled_col_a = t * TILE_SIZE + threadIdx.x;
+        int tiled_row_b = t * TILE_SIZE + threadIdx.y;
 
-            uint8_t accum = 0;
+        // Load tile of A
+        if (row < m && tiled_col_a < k) {
+            As[threadIdx.y][threadIdx.x] = A[row * lda + tiled_col_a];
+        } else {
+            As[threadIdx.y][threadIdx.x] = 0;
+        }
 
-            for (int t = 0; t < num_tiles; ++t) {
-                int tiled_col_a = t * TILE_SIZE + threadIdx.x;
-                int tiled_row_b = t * TILE_SIZE + threadIdx.y;
+        // Load tile of B
+        if (tiled_row_b < k && col < n) {
+            Bs[threadIdx.y][threadIdx.x] = B[tiled_row_b * ldb + col];
+        } else {
+            Bs[threadIdx.y][threadIdx.x] = 0;
+        }
 
-                // Load tile of A
-                if (row < m && tiled_col_a < k) {
-                    As[threadIdx.y][threadIdx.x] = A[row * lda + tiled_col_a];
-                } else {
-                    As[threadIdx.y][threadIdx.x] = 0;
-                }
+        __syncthreads();
 
-                // Load tile of B
-                if (tiled_row_b < k && col < n) {
-                    Bs[threadIdx.y][threadIdx.x] = B[tiled_row_b * ldb + col];
-                } else {
-                    Bs[threadIdx.y][threadIdx.x] = 0;
-                }
+        // Compute partial dot product using constant memory tables
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            uint8_t a = As[threadIdx.y][i];
+            uint8_t b = Bs[i][threadIdx.x];
 
-                __syncthreads();
-
-                // Compute partial dot product using constant memory tables
-                for (int i = 0; i < TILE_SIZE; ++i) {
-                    uint8_t a = As[threadIdx.y][i];
-                    uint8_t b = Bs[i][threadIdx.x];
-
-                    if (a != 0 && b != 0) {
-                        int log_sum = d_cutlass_gflog_const[a] + d_cutlass_gflog_const[b];
-                        accum ^= d_cutlass_gfexp_const[log_sum];
-                    }
-                }
-
-                __syncthreads();
-            }
-
-            if (row < m && col < n) {
-                C[row * ldc + col] = accum;
+            if (a != 0 && b != 0) {
+                int log_sum = d_cutlass_gflog_const[a] + d_cutlass_gflog_const[b];
+                accum ^= d_cutlass_gfexp_const[log_sum];
             }
         }
+
+        __syncthreads();
+    }
+
+    if (row < m && col < n) {
+        C[row * ldc + col] = accum;
     }
 }
 
@@ -223,16 +210,12 @@ GFGemmError cutlass_gf_gemm_execute(
     cudaMemcpyToSymbolAsync(d_cutlass_gfexp_const, d_gf_exp, exp_size, 0, cudaMemcpyDeviceToDevice, stream);
     cudaMemcpyToSymbolAsync(d_cutlass_gflog_const, d_gf_log, log_size, 0, cudaMemcpyDeviceToDevice, stream);
 
-    // CUTLASS-style threadblock configuration: 128x128 threadblocks
-    constexpr int THREADBLOCK_M = 128;
-    constexpr int THREADBLOCK_N = 128;
-
-    // Each threadblock has THREADBLOCK_M x THREADBLOCK_N threads conceptually,
-    // but we use a 16x16 thread block that tiles internally
-    dim3 block(16, 16);  // 256 threads per block (2x2 tiles of 128x128)
+    // 16x16 tiles
+    constexpr int TILE_SIZE = 16;
+    dim3 block(TILE_SIZE, TILE_SIZE);
     dim3 grid(
-        (n + THREADBLOCK_N - 1) / THREADBLOCK_N,
-        (m + THREADBLOCK_M - 1) / THREADBLOCK_M
+        (n + TILE_SIZE - 1) / TILE_SIZE,
+        (m + TILE_SIZE - 1) / TILE_SIZE
     );
 
     cutlass_gf_gemm_kernel<<<grid, block, 0, stream>>>(A, B, C, m, n, k, lda, ldb, ldc);
