@@ -53,6 +53,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 # Library target
 add_library(cutlass_gf_gemm STATIC
     src/cutlass_gf_gemm.cu
+    src/cutlass_gf_gemm_template.cu
 )
 
 set_target_properties(cutlass_gf_gemm PROPERTIES
@@ -88,5 +89,7 @@ install(FILES
     include/gf_ops.h
     include/cutlass_gf_gemm.h
     include/gf16.h
+    include/cutlass_gf28_traits.h
+    include/cutlass_gf_gemm_template.h
     DESTINATION include
 )
