@@ -18,17 +18,22 @@
 
 ```
 cutlass-gf-gemm/
-├── include/           # 头文件
-│   ├── gf_ops.h      # Galois Field 运算定义
-│   ├── cutlass_gf_gemm.h  # CUTLASS GF Gemm 主接口
-│   └── gf16.h        # GF(2^8) 查找表
-├── src/              # 源文件
-│   └── cutlass_gf_gemm.cu
-├── examples/         # 示例程序
-│   └── example_gf_gemm.cu
-├── tests/            # 测试程序
-│   └── test_gf_gemm.cu
-├── CMakeLists.txt    # CMake 构建配置
+├── include/                  # 头文件
+│   ├── gf_ops.h             # Galois Field 运算定义
+│   ├── cutlass_gf_gemm.h    # CUTLASS GF Gemm 主接口
+│   ├── cutlass_gf28_traits.h # CUTLASS numeric traits for GF(2^8)
+│   ├── cutlass_gf_gemm_template.h  # CUTLASS backend header
+│   └── gf16.h               # GF(2^8) 查找表
+├── src/                     # 源文件
+│   ├── cutlass_gf_gemm.cu
+│   └── cutlass_gf_gemm_template.cu  # CUTLASS backend implementation
+├── examples/                # 示例程序
+│   └── example_gf_gemm.cu   # Includes --profile mode
+├── tests/                   # 测试程序
+│   ├── test_gf_gemm.cu
+│   └── test_cutlass_traits.cu
+├── CMakeLists.txt           # CMake 构建配置
+├── PROFILER_REPORT.md       # Performance analysis from GPU servers
 └── README.md
 ```
 
@@ -49,8 +54,8 @@ cd cutlass-gf-gemm
 # 创建构建目录
 mkdir build && cd build
 
-# 配置 CMake
-cmake .. -DCMAKE_BUILD_TYPE=Release
+# 配置 CMake (指定 CUDA 架构以获得最佳性能)
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=80
 
 # 编译
 make -j8
@@ -58,6 +63,37 @@ make -j8
 # 运行测试
 ./tests/test_gf_gemm
 ```
+
+## Backend Selection
+
+The library supports two GEMM backends:
+
+- **Custom** (`GF_GEMM_BACKEND_CUSTOM`): Original 16×16 tiled kernel
+- **CUTLASS** (`GF_GEMM_BACKEND_CUTLASS`): CUTLASS-structured kernel with constant memory tables
+- **Auto** (`GF_GEMM_BACKEND_AUTO`): Default, selects CUTLASS with custom fallback
+
+```cpp
+GFGemmConfig config;
+gf_gemm_config_init_default(&config);
+config.backend = GF_GEMM_BACKEND_CUTLASS;  // Explicit selection
+
+GFGemmHandle handle;
+gf_gemm_create(&handle, &config);
+gf_gemm_mm(handle, m, n, k, d_A, k, d_B, n, d_C, n, 0);
+gf_gemm_destroy(handle);
+```
+
+Both backends produce identical results. Performance is within 1% on all tested sizes.
+
+## Profiling
+
+Run the built-in profiler for backend comparison:
+
+```bash
+./examples/example_gf_gemm --profile
+```
+
+For detailed analysis with metrics from both GPU servers, see `PROFILER_REPORT.md`.
 
 ## 使用示例
 
