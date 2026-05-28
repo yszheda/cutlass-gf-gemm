@@ -128,8 +128,8 @@ void cutlass_gf_gemm_free_tables(uint8_t* d_gf_exp, uint8_t* d_gf_log) {
 /**
  * @brief CUTLASS-style tiled GEMM kernel for GF(2^8)
  *
- * Uses 128x128 threadblock tiles (8 warps in M, 8 warps in N direction),
- * following CUTLASS threadblock swizzling patterns.
+ * Each 16x16 threadblock processes a 128x128 tile by having each thread
+ * loop over 8x8 sub-tiles. Uses CUTLASS constant memory patterns.
  */
 __global__ void cutlass_gf_gemm_kernel(const uint8_t* __restrict__ A,
                                         const uint8_t* __restrict__ B,
@@ -139,59 +139,63 @@ __global__ void cutlass_gf_gemm_kernel(const uint8_t* __restrict__ A,
     constexpr int THREADBLOCK_M = 128;
     constexpr int THREADBLOCK_N = 128;
     constexpr int TILE_SIZE = 16;
+    constexpr int SUB_TILES_M = THREADBLOCK_M / TILE_SIZE;  // 8
+    constexpr int SUB_TILES_N = THREADBLOCK_N / TILE_SIZE;  // 8
 
     int tb_row = blockIdx.y * THREADBLOCK_M;
     int tb_col = blockIdx.x * THREADBLOCK_N;
 
-    int local_row = threadIdx.y;
-    int local_col = threadIdx.x;
-
-    // Each thread computes a TILE_SIZE x TILE_SIZE tile
-    int row = tb_row + local_row;
-    int col = tb_col + local_col;
-
     __shared__ uint8_t As[TILE_SIZE][TILE_SIZE];
     __shared__ uint8_t Bs[TILE_SIZE][TILE_SIZE];
 
-    uint8_t accum = 0;
     int num_tiles = (k + TILE_SIZE - 1) / TILE_SIZE;
 
-    for (int t = 0; t < num_tiles; ++t) {
-        int tiled_col_a = t * TILE_SIZE + local_col;
-        int tiled_row_b = t * TILE_SIZE + local_row;
+    // Each thread handles SUB_TILES_M x SUB_TILES_N output elements
+    for (int st_m = 0; st_m < SUB_TILES_M; ++st_m) {
+        for (int st_n = 0; st_n < SUB_TILES_N; ++st_n) {
+            int row = tb_row + st_m * TILE_SIZE + threadIdx.y;
+            int col = tb_col + st_n * TILE_SIZE + threadIdx.x;
 
-        // Load tile of A
-        if (row < m && tiled_col_a < k) {
-            As[local_row][local_col] = A[row * lda + tiled_col_a];
-        } else {
-            As[local_row][local_col] = 0;
-        }
+            uint8_t accum = 0;
 
-        // Load tile of B
-        if (tiled_row_b < k && col < n) {
-            Bs[local_row][local_col] = B[tiled_row_b * ldb + col];
-        } else {
-            Bs[local_row][local_col] = 0;
-        }
+            for (int t = 0; t < num_tiles; ++t) {
+                int tiled_col_a = t * TILE_SIZE + threadIdx.x;
+                int tiled_row_b = t * TILE_SIZE + threadIdx.y;
 
-        __syncthreads();
+                // Load tile of A
+                if (row < m && tiled_col_a < k) {
+                    As[threadIdx.y][threadIdx.x] = A[row * lda + tiled_col_a];
+                } else {
+                    As[threadIdx.y][threadIdx.x] = 0;
+                }
 
-        // Compute partial dot product using constant memory tables
-        for (int i = 0; i < TILE_SIZE; ++i) {
-            uint8_t a = As[local_row][i];
-            uint8_t b = Bs[i][local_col];
+                // Load tile of B
+                if (tiled_row_b < k && col < n) {
+                    Bs[threadIdx.y][threadIdx.x] = B[tiled_row_b * ldb + col];
+                } else {
+                    Bs[threadIdx.y][threadIdx.x] = 0;
+                }
 
-            if (a != 0 && b != 0) {
-                int log_sum = d_cutlass_gflog_const[a] + d_cutlass_gflog_const[b];
-                accum ^= d_cutlass_gfexp_const[log_sum];
+                __syncthreads();
+
+                // Compute partial dot product using constant memory tables
+                for (int i = 0; i < TILE_SIZE; ++i) {
+                    uint8_t a = As[threadIdx.y][i];
+                    uint8_t b = Bs[i][threadIdx.x];
+
+                    if (a != 0 && b != 0) {
+                        int log_sum = d_cutlass_gflog_const[a] + d_cutlass_gflog_const[b];
+                        accum ^= d_cutlass_gfexp_const[log_sum];
+                    }
+                }
+
+                __syncthreads();
+            }
+
+            if (row < m && col < n) {
+                C[row * ldc + col] = accum;
             }
         }
-
-        __syncthreads();
-    }
-
-    if (row < m && col < n) {
-        C[row * ldc + col] = accum;
     }
 }
 
