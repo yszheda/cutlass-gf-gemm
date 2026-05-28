@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 #include <cuda_runtime.h>
 
 #define CUDA_CHECK(call) \
@@ -91,8 +92,105 @@ void gf_gemm_cpu(const uint8_t* A, const uint8_t* B, uint8_t* C,
     }
 }
 
+/**
+ * @brief Profiler: benchmark both backends and print metrics
+ */
+int run_profiler() {
+    printf("\n=== Profiler: Backend Performance Comparison ===\n\n");
+
+    struct BenchSize { int m, n, k; };
+    BenchSize sizes[] = {
+        {64, 64, 64},
+        {128, 128, 128},
+        {256, 256, 256},
+        {512, 512, 512},
+        {1024, 1024, 1024},
+    };
+    int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    const char* backend_names[] = {"Custom", "CUTLASS"};
+    GFGemmBackend backends[] = {GF_GEMM_BACKEND_CUSTOM, GF_GEMM_BACKEND_CUTLASS};
+    int num_backends = 2;
+
+    for (int b = 0; b < num_backends; ++b) {
+        printf("--- %s Backend ---\n", backend_names[b]);
+        printf("  %8s  %10s  %10s  %12s\n", "Size", "Time(ms)", "GMACS", "BW(GB/s)");
+        printf("  %8s  %10s  %10s  %12s\n", "--------", "----------", "----------", "------------");
+
+        for (int i = 0; i < num_sizes; ++i) {
+            int m = sizes[i].m, n = sizes[i].n, k = sizes[i].k;
+            size_t size_a = m * k, size_b = k * n, size_c = m * n;
+
+            uint8_t *d_A, *d_B, *d_C;
+            CUDA_CHECK(cudaMalloc(&d_A, size_a));
+            CUDA_CHECK(cudaMalloc(&d_B, size_b));
+            CUDA_CHECK(cudaMalloc(&d_C, size_c));
+
+            // Initialize with random data
+            std::vector<uint8_t> h_A(size_a), h_B(size_b);
+            srand(42 + i);
+            for (size_t j = 0; j < size_a; ++j) h_A[j] = rand() % 256;
+            for (size_t j = 0; j < size_b; ++j) h_B[j] = rand() % 256;
+            CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), size_a, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), size_b, cudaMemcpyHostToDevice));
+
+            GFGemmConfig config;
+            gf_gemm_config_init_default(&config);
+            config.backend = backends[b];
+
+            GFGemmHandle handle;
+            GF_GEMM_CHECK(gf_gemm_create(&handle, &config));
+
+            // Warm-up
+            GF_GEMM_CHECK(gf_gemm_mm(handle, m, n, k, d_A, k, d_B, n, d_C, n, 0));
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            // Benchmark
+            int num_iters = (m >= 512) ? 5 : 10;
+            cudaEventRecord(start, 0);
+            for (int j = 0; j < num_iters; ++j) {
+                GF_GEMM_CHECK(gf_gemm_mm(handle, m, n, k, d_A, k, d_B, n, d_C, n, 0));
+            }
+            cudaEventRecord(stop, 0);
+            CUDA_CHECK(cudaEventSynchronize(stop));
+
+            float elapsed_ms;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+            float avg_ms = elapsed_ms / num_iters;
+
+            // GMACS = 2 * m * n * k / time
+            float gmacs = (2.0f * m * n * k) / (avg_ms * 1e6f);
+
+            // Memory bandwidth estimate: read A + B, write C
+            float bytes = (size_a + size_b + size_c) * sizeof(uint8_t);
+            float bw_gbs = (bytes * num_iters) / (elapsed_ms * 1e6f);
+
+            printf("  %4dx%4d  %10.3f  %10.2f  %12.2f\n", m, n, avg_ms, gmacs, bw_gbs);
+
+            gf_gemm_destroy(handle);
+            cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+        }
+        printf("\n");
+    }
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     printf("=== CUTLASS GF(2^8) Matrix Multiplication Example ===\n\n");
+
+    // Check for --profile flag
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--profile") == 0) {
+            return run_profiler();
+        }
+    }
 
     // Matrix dimensions
     int m = 64;   // rows of A and C
