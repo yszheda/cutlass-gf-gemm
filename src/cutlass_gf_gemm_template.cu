@@ -45,7 +45,7 @@ struct Gf28ConstMmaOperator {
     };
 
 #ifdef __CUDA_ARCH__
-    GF_HOST_DEVICE
+    CUTLASS_HOST_DEVICE
     ElementD operator()(
         ElementA const& a,
         ElementB const& b,
